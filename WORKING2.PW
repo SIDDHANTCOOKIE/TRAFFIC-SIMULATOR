@@ -1,0 +1,353 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import threading
+import folium
+import webbrowser
+import tempfile
+import osmnx as ox
+import networkx as nx
+from geopy.geocoders import Nominatim
+from itertools import islice
+import random
+
+# Set OSMnx to use a specific CRS that works well with folium
+ox.settings.use_cache = True
+ox.settings.log_console = True
+
+# -----------------------------
+# Utilities
+# -----------------------------
+geolocator = Nominatim(user_agent="dsa_route_app")
+
+def geocode_candidates(place, limit=5):
+    try:
+        return geolocator.geocode(f"{place}, India", exactly_one=False, limit=limit) or []
+    except Exception:
+        return []
+
+def select_candidate_dialog(root, title, candidates):
+    if not candidates:
+        return None
+    sel = {"choice": None}
+    dlg = tk.Toplevel(root)
+    dlg.title(title)
+    dlg.transient(root)
+    dlg.grab_set()
+    dlg.geometry("700x320")
+    ttk.Label(dlg, text="Select the correct location from candidates:").pack(anchor="w", padx=8, pady=(8,0))
+    listbox = tk.Listbox(dlg, width=120, height=12)
+    listbox.pack(fill="both", expand=True, padx=8, pady=8)
+    for c in candidates:
+        desc = getattr(c, "address", None) or str(c)
+        lat = getattr(c, "latitude", None)
+        lon = getattr(c, "longitude", None)
+        listbox.insert(tk.END, f"{desc}  |  lat:{lat:.6f} lon:{lon:.6f}")
+    listbox.selection_set(0)
+    btn_frame = ttk.Frame(dlg)
+    btn_frame.pack(fill="x", padx=8, pady=(0,8))
+    def on_ok():
+        sel_idx = listbox.curselection()
+        if not sel_idx:
+            messagebox.showwarning("Select", "Choose a candidate or Cancel.")
+            return
+        sel["choice"] = candidates[sel_idx[0]]
+        dlg.destroy()
+    def on_cancel():
+        dlg.destroy()
+    ttk.Button(btn_frame, text="OK", command=on_ok).pack(side="right", padx=(0,8))
+    ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side="right")
+    root.wait_window(dlg)
+    return sel["choice"]
+
+def choose_place(root, prompt, query_text):
+    candidates = geocode_candidates(query_text, limit=7)
+    if not candidates:
+        raise ValueError(f"No geocoding candidates found for: {query_text}")
+    chosen = select_candidate_dialog(root, prompt, candidates)
+    if not chosen:
+        raise ValueError("Location selection cancelled by user")
+    return float(chosen.latitude), float(chosen.longitude)
+
+def convert_to_simple_graph(G_multi):
+    """
+    Convert a MultiDiGraph from OSMnx to a simple weighted DiGraph
+    by keeping the shortest edge between each pair of nodes.
+    """
+    G_simple = nx.DiGraph()
+    for u, v, data in G_multi.edges(data=True):
+        w = data.get("length", 1)
+        if G_simple.has_edge(u, v):
+            if w < G_simple[u][v]['weight']:
+                G_simple[u][v]['weight'] = w
+        else:
+            G_simple.add_edge(u, v, weight=w)
+    for n, data in G_multi.nodes(data=True):
+        G_simple.add_node(n, **data)
+    return G_simple
+
+def ensure_wgs84(G):
+    """Ensure the graph is in WGS84 (lat/lon) coordinate system"""
+    if 'crs' in G.graph and G.graph['crs'] != 'epsg:4326':
+        # Convert to WGS84 if not already
+        G = ox.projection.project_graph(G, to_crs='epsg:4326')
+    elif 'crs' not in G.graph:
+        # Assume it's WGS84 if no CRS is specified
+        G.graph['crs'] = 'epsg:4326'
+    return G
+
+def k_shortest_paths(G, start_point, end_point, k=3):
+    # Ensure the graph is in WGS84
+    G = ensure_wgs84(G)
+    
+    # Convert lat/lon to appropriate format for nearest_nodes
+    start_node = ox.distance.nearest_nodes(G, X=start_point[1], Y=start_point[0])
+    end_node = ox.distance.nearest_nodes(G, X=end_point[1], Y=end_point[0])
+    
+    # Get k shortest paths
+    paths = list(islice(nx.shortest_simple_paths(G, start_node, end_node, weight="weight"), k))
+    
+    # Find a longer path by avoiding the shortest path edges
+    if paths:
+        # Create a copy of the graph
+        G_long = G.copy()
+        
+        # Increase weight of edges in the shortest path to encourage a different route
+        shortest_path = paths[0]
+        for i in range(len(shortest_path) - 1):
+            u, v = shortest_path[i], shortest_path[i + 1]
+            if G_long.has_edge(u, v):
+                G_long[u][v]['weight'] *= 5  # Make these edges much less attractive
+        
+        # Find a path that avoids the shortest path as much as possible
+        try:
+            longer_path = nx.shortest_path(G_long, start_node, end_node, weight="weight")
+            paths.append(longer_path)
+        except:
+            # If we can't find a longer path, just use the longest of the k shortest
+            paths.append(max(paths, key=lambda p: sum(G[u][v]['weight'] for u, v in zip(p[:-1], p[1:]))))
+    
+    return paths
+
+def compute_path_distance(G, path):
+    return sum(G[u][v]['weight'] for u, v in zip(path[:-1], path[1:])) / 1000
+
+def get_node_coordinates(G, node_id):
+    """Extract coordinates from a node in a consistent way"""
+    node_data = G.nodes[node_id]
+    if 'y' in node_data and 'x' in node_data:
+        return (node_data['y'], node_data['x'])
+    elif 'lat' in node_data and 'lon' in node_data:
+        return (node_data['lat'], node_data['lon'])
+    else:
+        # If coordinates aren't in the expected format, try to extract them
+        # This might happen if the graph is in a different projection
+        pos = (G.nodes[node_id].get('y', 0), G.nodes[node_id].get('x', 0))
+        if pos != (0, 0):
+            return pos
+        # Last resort: use the node ID as coordinates (this is not ideal)
+        return (node_id, node_id)
+
+# -----------------------------
+# GUI Application
+# -----------------------------
+class DSAVisualApp:
+    def __init__(self, root):
+        self.root = root
+        root.title("DSA Route Visualizer")
+        root.geometry("1000x600")
+        root.columnconfigure(0, weight=3)
+        root.columnconfigure(1, weight=2)
+        root.rowconfigure(0, weight=1)
+
+        # Left frame (inputs + table + buttons)
+        self.frame = ttk.Frame(root, padding=12)
+        self.frame.grid(row=0, column=0, sticky="nsew")
+        self.frame.columnconfigure(1, weight=1)
+        self.frame.rowconfigure(3, weight=1)
+
+        ttk.Label(self.frame, text="Start Location:").grid(row=0, column=0, sticky="w")
+        self.start_entry = ttk.Entry(self.frame, width=50)
+        self.start_entry.grid(row=0, column=1, sticky="we", padx=6, pady=4)
+
+        ttk.Label(self.frame, text="End Location:").grid(row=1, column=0, sticky="w")
+        self.end_entry = ttk.Entry(self.frame, width=50)
+        self.end_entry.grid(row=1, column=1, sticky="we", padx=6, pady=4)
+
+        controls = ttk.Frame(self.frame)
+        controls.grid(row=2, column=0, columnspan=2, sticky="we")
+        self.search_btn = ttk.Button(controls, text="Find Routes", command=self.start_find_routes)
+        self.search_btn.pack(side="left", padx=(0,8))
+        self.status = ttk.Label(controls, text="Ready")
+        self.status.pack(side="left", padx=12)
+
+        cols = ("rank", "distance_km")
+        self.tree = ttk.Treeview(self.frame, columns=cols, show="headings", height=10)
+        self.tree.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=2, pady=6)
+        self.tree.heading("rank", text="Route #")
+        self.tree.column("rank", width=80, anchor="center")
+        self.tree.heading("distance_km", text="Distance (km)")
+        self.tree.column("distance_km", width=120, anchor="center")
+
+        vsb = ttk.Scrollbar(self.frame, orient="vertical", command=self.tree.yview)
+        vsb.grid(row=3, column=2, sticky="ns")
+        self.tree.configure(yscrollcommand=vsb.set)
+
+        self.open_map_btn = ttk.Button(self.frame, text="Open Map for All Routes", command=self.open_all_routes_map)
+        self.open_map_btn.grid(row=4, column=0, columnspan=2, sticky="we", pady=8)
+
+        # Right frame (Dijkstra explanation)
+        self.panel = ttk.Frame(root, padding=12)
+        self.panel.grid(row=0, column=1, sticky="nsew")
+        self.panel.rowconfigure(1, weight=1)
+        self.panel.columnconfigure(0, weight=1)
+        ttk.Label(self.panel, text="Dijkstra Path Explanation:").grid(row=0, column=0, sticky="w")
+        self.text_panel = tk.Text(self.panel, wrap="word")
+        self.text_panel.grid(row=1, column=0, sticky="nsew")
+        self.panel_scroll = ttk.Scrollbar(self.panel, orient="vertical", command=self.text_panel.yview)
+        self.panel_scroll.grid(row=1, column=1, sticky="ns")
+        self.text_panel.configure(yscrollcommand=self.panel_scroll.set)
+        
+        # Add theoretical explanation
+        explanation = """
+Dijkstra's Algorithm:
+
+Dijkstra's algorithm is an algorithm for finding the shortest paths between nodes in a graph, which may represent, for example, road networks. It was conceived by computer scientist Edsger W. Dijkstra in 1956.
+
+The algorithm works by building a set of nodes that have minimal distance from the source. It uses a priority queue to select the node with the current minimum distance, updates the distances of its neighbors, and repeats until the destination is reached.
+
+K-Shortest Paths:
+
+The k-shortest path algorithm finds not just the single shortest path, but the k shortest paths in increasing order of length. This is useful for considering alternative routes, which might be slightly longer but have other desirable properties.
+
+In this application, we use Yen's algorithm to find the k-shortest paths. Yen's algorithm uses Dijkstra's algorithm as a subroutine.
+
+Longer Path:
+
+We also calculate a longer path by penalizing the edges of the shortest path, which forces the algorithm to find an alternative, typically longer route. This is useful for comparison purposes.
+        """
+        self.text_panel.insert("1.0", explanation)
+        self.text_panel.config(state="disabled")  # Make it read-only
+
+        self.cached_routes = []
+
+    def set_status(self, txt):
+        self.status.config(text=txt)
+        self.root.update_idletasks()
+
+    def start_find_routes(self):
+        t = threading.Thread(target=self.find_routes, daemon=True)
+        t.start()
+
+    def find_routes(self):
+        start_text = self.start_entry.get().strip()
+        end_text = self.end_entry.get().strip()
+        if not start_text or not end_text:
+            messagebox.showwarning("Input needed", "Enter both start and end locations.")
+            return
+
+        self.search_btn.config(state="disabled")
+        self.set_status("Resolving locations...")
+
+        try:
+            start_latlon = choose_place(self.root, "Select start location", start_text)
+            end_latlon = choose_place(self.root, "Select end location", end_text)
+
+            self.set_status("Building road network...")
+            mid_lat = (start_latlon[0] + end_latlon[0]) / 2
+            mid_lon = (start_latlon[1] + end_latlon[1]) / 2
+
+            approx_dist = max(
+                abs(start_latlon[0] - end_latlon[0]),
+                abs(start_latlon[1] - end_latlon[1])
+            ) * 111000 + 500
+            approx_dist = min(approx_dist, 5000)  # max 5 km radius
+
+            try:
+                # Get graph with WGS84 CRS (latitude/longitude)
+                G_multi = ox.graph_from_point(
+                    (mid_lat, mid_lon), 
+                    dist=approx_dist, 
+                    network_type="drive", 
+                    simplify=True
+                )
+                
+                # Ensure the graph is in WGS84
+                G_multi = ensure_wgs84(G_multi)
+                
+                # Convert to simple graph for pathfinding
+                G = convert_to_simple_graph(G_multi)
+
+                self.set_status("Computing paths...")
+                paths = k_shortest_paths(G, start_latlon, end_latlon, k=3)
+                self.cached_routes = [(G, path, compute_path_distance(G, path)) for path in paths]
+
+                # Update table
+                for i in self.tree.get_children():
+                    self.tree.delete(i)
+                for idx, (_, _, dist) in enumerate(self.cached_routes):
+                    if idx < 3:
+                        route_name = f"P{idx+1}"
+                    else:
+                        route_name = "Longer Path"
+                    self.tree.insert("", "end", iid=str(idx), values=(route_name, f"{dist:.2f}"))
+
+                self.set_status("Done. Select a route and open map.")
+
+            except MemoryError:
+                messagebox.showerror("Memory Error", "The selected area is too large. Try closer locations.")
+                self.set_status("Error")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to process map data: {str(e)}")
+                self.set_status("Error")
+
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            self.set_status("Error")
+        finally:
+            self.search_btn.config(state="normal")
+
+    def open_all_routes_map(self):
+        if not self.cached_routes:
+            messagebox.showinfo("Select", "Find routes first.")
+            return
+
+        colors = ["blue", "green", "red", "purple"]
+        # Use midpoint of first path for map centering
+        G, path, distance = self.cached_routes[0]
+        
+        # Get coordinates for the path
+        coords = [get_node_coordinates(G, n) for n in path]
+        
+        if not coords:
+            messagebox.showerror("Error", "Could not extract coordinates from path")
+            return
+            
+        mid = coords[len(coords)//2]
+        m = folium.Map(location=mid, zoom_start=14)
+
+        for idx, (G, path, distance) in enumerate(self.cached_routes):
+            coords = [get_node_coordinates(G, n) for n in path]
+            
+            if coords:
+                if idx < 3:
+                    route_name = f"P{idx+1}"
+                else:
+                    route_name = "Longer Path"
+                    
+                folium.PolyLine(coords, color=colors[idx % len(colors)], weight=6, opacity=0.7,
+                                tooltip=f"{route_name} Distance: {distance:.2f} km").add_to(m)
+                folium.Marker(coords[0], icon=folium.Icon(color="green"), popup=f"{route_name} Start").add_to(m)
+                folium.Marker(coords[-1], icon=folium.Icon(color="red"), popup=f"{route_name} End").add_to(m)
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".html", delete=False)
+        m.save(tmp.name)
+        webbrowser.open("file://" + tmp.name)
+        self.set_status("Opened all routes in browser.")
+
+# -----------------------------
+# Run
+# -----------------------------
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = DSAVisualApp(root)
+    root.mainloop()
